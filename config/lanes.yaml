@@ -1,0 +1,14 @@
+lanes:
+  - id: A
+    camera_source: "data/lanes/laneA.jpg"
+  - id: B
+    camera_source: "data/lanes/laneB.jpg"
+  - id: C
+    camera_source: "data/lanes/laneC.jpg"
+  - id: D
+    camera_source: "data/lanes/laneD.jpg"
+
+intersection:
+  min_green: 8
+  max_green: 60
+  total_cycle_time: 120

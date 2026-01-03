@@ -1,0 +1,5 @@
+vehicle_weights:
+  motorcycle: 0.5
+  car: 1.0
+  bus: 2.5
+  truck: 3.0

@@ -1,0 +1,18 @@
+# Core
+python-dotenv
+pyyaml
+
+# Computer Vision
+opencv-python
+numpy
+
+#audio
+soundfile
+
+# YOLOv8
+ultralytics
+torch
+torchvision
+
+# Utilities
+tqdm

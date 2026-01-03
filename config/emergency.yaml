@@ -1,0 +1,3 @@
+override:
+  min_confidence: 0.7
+  override_green_time: 40
