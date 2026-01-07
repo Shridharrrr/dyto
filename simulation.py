@@ -11,7 +11,7 @@ defaultRed = 150
 defaultYellow = 3
 defaultGreen = 15
 defaultMinimum = 5
-defaultMaximum = 60
+defaultMaximum = 30
 
 # Keeping track of our traffic signals
 signals = []
@@ -98,6 +98,7 @@ savedSignalStates = []   # Save signal states before emergency
 interruptedGreen = -1    # Track which signal was interrupted by emergency
 paused = False           # Pause state
 signal_lock = threading.Lock()  # Thread safety
+is_processing_emergency_transition = False  # Prevent recursive emergency transitions
 
 # Performance Metrics
 class PerformanceMetrics:
@@ -425,6 +426,7 @@ def calculate_pressure(direction):
 # Setting up our traffic signals
 def initialize():
     ts1 = TrafficSignal(0, defaultYellow, defaultGreen, defaultMinimum, defaultMaximum)
+    ts1.lastGreenTime = 0  # First signal starts green
     signals.append(ts1)
     ts2 = TrafficSignal(ts1.red+ts1.yellow+ts1.green, defaultYellow, defaultGreen, defaultMinimum, defaultMaximum)
     signals.append(ts2)
@@ -503,147 +505,201 @@ def select_next_signal():
     # Fallback to round-robin
     return (currentGreen + 1) % noOfSignals
 
-# IMPROVED: Handle multiple ambulances with queue
-def trigger_emergency(direction_number, ambulance_vehicle):
+# Internal emergency trigger (assumes lock is already held)
+def _trigger_emergency_internal(direction_number, ambulance_vehicle):
     global emergencyMode, activeEmergencyDirection, savedSignalStates, currentGreen, currentYellow, nextGreen, interruptedGreen
     
+    # Add ambulance to queue if not already there
+    if ambulance_vehicle not in emergencyQueue:
+        emergencyQueue.append(ambulance_vehicle)
+        print(f"Ambulance added to emergency queue from {directionNumbers[direction_number]}. Queue size: {len(emergencyQueue)}")
+    
+    # If already in emergency mode for this direction, just extend
+    if emergencyMode and activeEmergencyDirection == direction_number:
+        print(f"Extending emergency mode for {directionNumbers[direction_number]}")
+        return
+    
+    # If emergency mode active for different direction, queue this one
+    if emergencyMode and activeEmergencyDirection != direction_number:
+        print(f"Emergency already active for {directionNumbers[activeEmergencyDirection]}. Queueing {directionNumbers[direction_number]}")
+        return
+    
+    # Start new emergency mode
+    emergencyMode = True
+    activeEmergencyDirection = direction_number
+    
+    # Save which signal was interrupted
+    interruptedGreen = currentGreen
+    print(f"EMERGENCY MODE ACTIVATED for {directionNumbers[direction_number]}")
+    print(f"Interrupted signal: {directionNumbers[interruptedGreen]} (will resume after emergency)")
+    
+    # Save current signal states
+    savedSignalStates = []
+    for i in range(noOfSignals):
+        savedSignalStates.append({
+            'red': signals[i].red,
+            'yellow': signals[i].yellow,
+            'green': signals[i].green
+        })
+    
+    # Set emergency direction to green
+    currentGreen = direction_number
+    currentYellow = 0
+    nextGreen = (currentGreen + 1) % noOfSignals
+    
+    # Clear all signals first
+    for i in range(noOfSignals):
+        signals[i].green = 0
+        signals[i].yellow = 0
+        signals[i].red = 0
+    
+    # Set emergency lane to green
+    signals[direction_number].green = emergencyGreenTime
+    signals[direction_number].yellow = defaultYellow
+    signals[direction_number].red = 0
+    
+    # Update lastGreenTime for emergency signal
+    signals[direction_number].lastGreenTime = timeElapsed
+    
+    # All others stay red
+    for i in range(noOfSignals):
+        if i != direction_number:
+            signals[i].red = emergencyGreenTime + defaultYellow
+
+# IMPROVED: Handle multiple ambulances with queue
+def trigger_emergency(direction_number, ambulance_vehicle):
     with signal_lock:
-        # Add ambulance to queue if not already there
-        if ambulance_vehicle not in emergencyQueue:
-            emergencyQueue.append(ambulance_vehicle)
-            print(f"Ambulance added to emergency queue from {directionNumbers[direction_number]}. Queue size: {len(emergencyQueue)}")
-        
-        # If already in emergency mode for this direction, just extend
-        if emergencyMode and activeEmergencyDirection == direction_number:
-            print(f"Extending emergency mode for {directionNumbers[direction_number]}")
-            return
-        
-        # If emergency mode active for different direction, queue this one
-        if emergencyMode and activeEmergencyDirection != direction_number:
-            print(f"Emergency already active for {directionNumbers[activeEmergencyDirection]}. Queueing {directionNumbers[direction_number]}")
-            return
-        
-        # Start new emergency mode
-        emergencyMode = True
-        activeEmergencyDirection = direction_number
-        
-        # Save which signal was interrupted
-        interruptedGreen = currentGreen
-        print(f"EMERGENCY MODE ACTIVATED for {directionNumbers[direction_number]}")
-        print(f"Interrupted signal: {directionNumbers[interruptedGreen]} (will resume after emergency)")
-        
-        # Save current signal states
-        savedSignalStates = []
-        for i in range(noOfSignals):
-            savedSignalStates.append({
-                'red': signals[i].red,
-                'yellow': signals[i].yellow,
-                'green': signals[i].green
-            })
-        
-        # Set emergency direction to green
-        currentGreen = direction_number
-        currentYellow = 0
-        nextGreen = (currentGreen + 1) % noOfSignals
-        
-        # Clear all signals first
-        for i in range(noOfSignals):
-            signals[i].green = 0
-            signals[i].yellow = 0
-            signals[i].red = 0
-        
-        # Set emergency lane to green
-        signals[direction_number].green = emergencyGreenTime
-        signals[direction_number].yellow = defaultYellow
-        signals[direction_number].red = 0
-        
-        # All others stay red
-        for i in range(noOfSignals):
-            if i != direction_number:
-                signals[i].red = emergencyGreenTime + defaultYellow
+        _trigger_emergency_internal(direction_number, ambulance_vehicle)
 
 # Remove ambulance from queue when it crosses
 def remove_from_emergency_queue(ambulance_vehicle):
-    global emergencyQueue
+    global emergencyQueue, is_processing_emergency_transition
+    
+    should_end_emergency = False
     
     with signal_lock:
         if ambulance_vehicle in emergencyQueue:
             emergencyQueue.remove(ambulance_vehicle)
             print(f"Ambulance crossed. Remaining in queue: {len(emergencyQueue)}")
             
-            # If no more ambulances in this direction, check for next emergency
-            if len(emergencyQueue) == 0:
-                # Will end emergency in the main loop
-                pass
+            # If no more ambulances in queue, check if we should end emergency
+            if len(emergencyQueue) == 0 and not is_processing_emergency_transition:
+                # Check if there are any other uncrossed emergency vehicles
+                has_uncrossed = False
+                for lane in range(3):
+                    for v in vehicles[directionNumbers[activeEmergencyDirection]][lane]:
+                        if v.is_emergency and v.crossed == 0 and v != ambulance_vehicle:
+                            has_uncrossed = True
+                            break
+                    if has_uncrossed:
+                        break
+                
+                if not has_uncrossed:
+                    print("No more emergency vehicles. Will end emergency mode.")
+                    should_end_emergency = True
+    
+    # CRITICAL: Call end_emergency OUTSIDE the lock to avoid deadlock
+    if should_end_emergency:
+        end_emergency()
 
 # End emergency mode and restore normal operation
 def end_emergency():
-    global emergencyMode, activeEmergencyDirection, savedSignalStates, currentGreen, nextGreen, interruptedGreen
+    global emergencyMode, activeEmergencyDirection, savedSignalStates, currentGreen, nextGreen, interruptedGreen, is_processing_emergency_transition
     
     with signal_lock:
+        # Prevent recursive calls
+        if is_processing_emergency_transition:
+            print("Already processing emergency transition, skipping...")
+            return
+            
         if not emergencyMode:
             return
         
-        print("Ending emergency mode. Restoring normal operation.")
+        is_processing_emergency_transition = True
         
-        emergencyMode = False
-        prev_emergency_dir = activeEmergencyDirection
-        activeEmergencyDirection = -1
-        
-        # Return to the interrupted signal
-        if interruptedGreen != -1:
-            print(f"Resuming interrupted signal: {directionNumbers[interruptedGreen]}")
-            currentGreen = interruptedGreen
-            nextGreen = (currentGreen + 1) % noOfSignals
-            interruptedGreen = -1  # Reset
-        
-        # Restore saved signal states if available
-        if savedSignalStates:
-            for i in range(noOfSignals):
-                # Prevent negative values
-                signals[i].red = max(0, savedSignalStates[i]['red'])
-                signals[i].yellow = max(0, savedSignalStates[i]['yellow'])
-                signals[i].green = max(0, savedSignalStates[i]['green'])
+        try:
+            print("Ending emergency mode. Restoring normal operation.")
             
-            # If the interrupted signal had no green time left, give it default green time
-            if signals[currentGreen].green == 0 and signals[currentGreen].yellow == 0:
-                print(f"Interrupted signal {directionNumbers[currentGreen]} had completed. Giving new green cycle.")
-                signals[currentGreen].green = defaultGreen
-                signals[currentGreen].yellow = defaultYellow
-                signals[currentGreen].red = 0
-                
-                # Recalculate red times for other signals
+            emergencyMode = False
+            prev_emergency_dir = activeEmergencyDirection
+            activeEmergencyDirection = -1
+            
+            # Return to the interrupted signal
+            if interruptedGreen != -1:
+                print(f"Resuming interrupted signal: {directionNumbers[interruptedGreen]}")
+                currentGreen = interruptedGreen
+                nextGreen = (currentGreen + 1) % noOfSignals
+                interruptedGreen = -1  # Reset
+            
+            # Restore saved signal states if available
+            if savedSignalStates:
                 for i in range(noOfSignals):
-                    if i != currentGreen:
+                    # Prevent negative values
+                    signals[i].red = max(0, savedSignalStates[i]['red'])
+                    signals[i].yellow = max(0, savedSignalStates[i]['yellow'])
+                    signals[i].green = max(0, savedSignalStates[i]['green'])
+                
+                # If the interrupted signal had no green time left, give it default green time
+                if signals[currentGreen].green == 0 and signals[currentGreen].yellow == 0:
+                    print(f"Interrupted signal {directionNumbers[currentGreen]} had completed. Giving new green cycle.")
+                    signals[currentGreen].green = defaultGreen
+                    signals[currentGreen].yellow = defaultYellow
+                    signals[currentGreen].red = 0
+                    
+                    # Recalculate red times for other signals
+                    for i in range(noOfSignals):
+                        if i != currentGreen:
+                            signals[i].green = 0
+                            signals[i].yellow = 0
+                            # Calculate based on cycle
+                            if i == nextGreen:
+                                signals[i].red = signals[currentGreen].green + signals[currentGreen].yellow
+                            else:
+                                signals[i].red = defaultRed
+                
+                savedSignalStates = []
+            else:
+                # If no saved states, reset to defaults with interrupted signal getting green
+                for i in range(noOfSignals):
+                    if i == currentGreen:
+                        signals[i].green = defaultGreen
+                        signals[i].yellow = defaultYellow
+                        signals[i].red = 0
+                    else:
                         signals[i].green = 0
                         signals[i].yellow = 0
-                        # Calculate based on cycle
                         if i == nextGreen:
                             signals[i].red = signals[currentGreen].green + signals[currentGreen].yellow
                         else:
                             signals[i].red = defaultRed
             
-            savedSignalStates = []
-        else:
-            # If no saved states, reset to defaults with interrupted signal getting green
-            for i in range(noOfSignals):
-                if i == currentGreen:
-                    signals[i].green = defaultGreen
-                    signals[i].yellow = defaultYellow
-                    signals[i].red = 0
+            # Check if there are more ambulances waiting (prepare data while holding lock)
+            next_ambulance_to_process = None
+            if len(emergencyQueue) > 0:
+                next_ambulance = emergencyQueue[0]
+                
+                # Validate the ambulance hasn't crossed yet
+                if hasattr(next_ambulance, 'crossed') and next_ambulance.crossed == 0:
+                    next_ambulance_to_process = (next_ambulance.direction_number, next_ambulance)
+                    print(f"Will process next ambulance in queue from {directionNumbers[next_ambulance.direction_number]}")
                 else:
-                    signals[i].green = 0
-                    signals[i].yellow = 0
-                    if i == nextGreen:
-                        signals[i].red = signals[currentGreen].green + signals[currentGreen].yellow
-                    else:
-                        signals[i].red = defaultRed
+                    # Ambulance already crossed, remove it and check again
+                    print(f"Next ambulance in queue already crossed, removing...")
+                    emergencyQueue.pop(0)
+                    # Check if there are more
+                    if len(emergencyQueue) > 0:
+                        next_ambulance = emergencyQueue[0]
+                        if hasattr(next_ambulance, 'crossed') and next_ambulance.crossed == 0:
+                            next_ambulance_to_process = (next_ambulance.direction_number, next_ambulance)
+                            print(f"Will process next valid ambulance from {directionNumbers[next_ambulance.direction_number]}")
         
-        # Check if there are more ambulances waiting
-        if len(emergencyQueue) > 0:
-            next_ambulance = emergencyQueue[0]
-            print(f"Processing next ambulance in queue from {directionNumbers[next_ambulance.direction_number]}")
-            trigger_emergency(next_ambulance.direction_number, next_ambulance)
+        finally:
+            # Always reset the transition flag
+            is_processing_emergency_transition = False
+    
+    # CRITICAL: Trigger next emergency OUTSIDE the lock to avoid deadlock
+    if next_ambulance_to_process:
+        trigger_emergency(next_ambulance_to_process[0], next_ambulance_to_process[1])
 
 # Function to toggle pause state
 def toggle_pause():
@@ -701,6 +757,7 @@ def repeat():
                 currentYellow = 0
 
             # 3. SWITCH TO NEXT SIGNAL
+            should_end_emergency = False  # Initialize before lock
             with signal_lock:
                 if not emergencyMode:
                     # Normal Cycle transition
@@ -734,8 +791,14 @@ def repeat():
                                     has_uncrossed = True
                                     break
                         if not has_uncrossed:
-                            end_emergency()
-                    time.sleep(0.5)
+                            should_end_emergency = True
+            
+            # CRITICAL: Call end_emergency OUTSIDE the lock to avoid deadlock
+            if should_end_emergency:
+                end_emergency()
+            
+            if emergencyMode:
+                time.sleep(0.5)
         else:
             time.sleep(0.5)
 
@@ -989,18 +1052,28 @@ class Main:
             pause_text = large_font.render("PAUSED", True, yellow, black)
             screen.blit(pause_text, (600, 50))
         
-        # Emergency status
-        if emergencyMode:
+        # Emergency status (thread-safe display)
+        # Capture emergency state atomically to avoid race conditions
+        with signal_lock:
+            display_emergency = emergencyMode
+            if display_emergency and activeEmergencyDirection >= 0:
+                emergency_dir = activeEmergencyDirection
+                emergency_queue_size = len(emergencyQueue)
+                emergency_green_time = signals[activeEmergencyDirection].green
+            else:
+                display_emergency = False
+        
+        if display_emergency:
             emergency_text = large_font.render("EMERGENCY!", True, red, black)
             screen.blit(emergency_text, (200, 100))
             
-            direction_text = font.render(f"Active: {directionNumbers[activeEmergencyDirection].upper()}", True, red, white)
+            direction_text = font.render(f"Active: {directionNumbers[emergency_dir].upper()}", True, red, white)
             screen.blit(direction_text, (200, 150))
             
-            queue_text = font.render(f"Queue: {len(emergencyQueue)} ambulance(s)", True, orange, white)
+            queue_text = font.render(f"Queue: {emergency_queue_size} ambulance(s)", True, orange, white)
             screen.blit(queue_text, (200, 180))
             
-            timer_text = font.render(f"Green time: {signals[activeEmergencyDirection].green}s", True, green, white)
+            timer_text = font.render(f"Green time: {emergency_green_time}s", True, green, white)
             screen.blit(timer_text, (200, 210))
         
         # Performance Metrics Display
